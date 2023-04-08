@@ -2,7 +2,13 @@
 
 let
   pythonEnv = pkgs.python39.withPackages (p: with p; [
+    datasets
+    librosa
     lxml
+    soundfile
+    torch-bin
+    torchaudio-bin
+    transformers
   ]);
 
   venvDir = "./.venv";
@@ -18,7 +24,11 @@ let
   '';
 
   installPythonPackages = ''
-    pip install ipapy datasets librosa soundfile phonemizer
+    pip install phonemizer evaluate jiwer
+  '';
+
+  setupEnvs = ''
+    export PHONEMIZER_ESPEAK_LIBRARY=$(find ${pkgs.espeak}/lib -name libespeak-ng.so)
   '';
 in
 (pkgs.mkShell.override {  }) {
@@ -27,12 +37,14 @@ in
 
   packages = with pkgs; [
     (callPackage ./mitlm {})
+    espeak
+    mbrola
     phonetisaurus
     python39Packages.pip
     python39Packages.virtualenv
     pythonEnv
   ];
 
-  shellHook = createVenv + activateVenv + installPythonPackages;
+  shellHook = createVenv + activateVenv + installPythonPackages + setupEnvs;
 }
 
