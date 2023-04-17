@@ -6,91 +6,78 @@ import os
 import re
 import torch
 import torch.onnx
-from .phoneme_remapper import PhonemeRemapper
+import tempfile
+from .remapper import PhonemeRemapper
+from .phonemizer import EpitranPhonemizer
 from dataclasses import dataclass
-from phonemizer.backend import BACKENDS
-from phonemizer.separator import Separator
 from torchaudio.models.wav2vec2.utils import import_huggingface_model
 from transformers import Wav2Vec2CTCTokenizer, Wav2Vec2FeatureExtractor, Wav2Vec2Processor, Wav2Vec2ForCTC, TrainingArguments, Trainer, Wav2Vec2Config
 from typing import Dict, List, Union
 
 
-def add_command(subparsers):
-    parser = subparsers.add_parser('wav2vec2', help='train speech-to-text model')
-    parser.add_argument('-d', '--data', required=True, help='path to timit dataset')
-    parser.add_argument('-o', '--out', required=True, help='model output dir')
-    parser.set_defaults(func=lambda args: train(args.config, args.data, args.out))
+sampling_rate = 16000
 
 
-def train(config_path, data_path, output_path):
-    with open(config_path) as file:
-        config = json.load(file)
+def _prepare_vocabulary(remapper):
+    vocab = dict()
+    vocab["<pad>"] = len(vocab)
+    vocab["<unk>"] = len(vocab)
+    vocab["|"] = len(vocab)
+    for phoneme in remapper.vocabulary:
+        if phoneme not in vocab:
+            vocab[phoneme] = len(vocab)
+    return vocab
 
-    remapper = PhonemeRemapper(phonemes=config["phonemes"], mapping=config["mapping"])
 
-    # Return actual dataset from here
-    def prepare_dataset():
-        backend = BACKENDS["espeak"]("en-us")
-        timit = datasets.load_dataset("timit_asr", data_dir=data_path)
-        timit = timit.remove_columns(["phonetic_detail", "word_detail", "dialect_region", "id", "sentence_type", "speaker_id", "file"])
+def _prepare_dataset(languages, split, samples, phonemizer, remapper):
+    def preprocess_dataset(language, dataset):
+        dataset = dataset.remove_columns(list(set(dataset.column_names).difference({ "sentence", "audio" })))
 
-        def remove_special_characters(batch):
-            batch["text"] = re.sub('[\,\?\.\!\-\;\:\"]', '', batch["text"]).lower()
+        def remap(batch):
+            res = phonemizer.phonemize(language, [sentence for sentence in batch["sentence"]])
+            ret = []
+            for sentences in res:
+                sentence = []
+                for phonemes in sentences:
+                    phonemes = remapper.remap(phonemes)
+                    sentence.append("".join(phonemes))
+                ret.append(" ".join(sentence))
+            batch["sentence"] = ret
             return batch
 
-        timit = timit.map(remove_special_characters)
+        global sampling_rate
+        dataset = dataset.cast_column("audio", datasets.Audio(sampling_rate=sampling_rate))
+        return dataset.map(remap, batched=True)
 
-        def map_to_phonemes(batch):
-            res = backend.phonemize(
-                batch["text"],
-                separator=Separator(phone='|'),
-                strip=True,
-            )
-
-            for i in range(len(res)):
-                words = res[i].split(" ")
-                for j in range(len(words)):
-                    phonemes = remapper.remap(words[j].split("|"))
-                    words[j] = "".join(phonemes)
-                res[i] = " ".join(words)
-
-            batch["text"] = res
-            return batch
-
-        timit = timit.map(map_to_phonemes, batched=True)
-
-        vocab = dict()
-        vocab["<pad>"] = len(vocab)
-        vocab["<unk>"] = len(vocab)
-        vocab["|"] = len(vocab)
-        vocab = vocab | {v: k + len(vocab) for k, v in enumerate(list(remapper.phonemes))}
-
-        return timit, vocab
+    res_datasets = []
+    for language in languages:
+        dataset = datasets.load_dataset("mozilla-foundation/common_voice_13_0", language, split=split, streaming=True).shuffle(seed=7).take(samples)
+        dataset = preprocess_dataset(language, dataset)
+        res_datasets.append(dataset)
+    return datasets.concatenate_datasets(res_datasets)
 
 
-    dataset, vocab = prepare_dataset()
-
-    result_path = os.path.join(output_path, "exported")
-    try:
-        os.mkdir(output_path)
-    except FileExistsError:
-        pass
-
-    try:
-        os.mkdir(result_path)
-    except FileExistsError:
-        pass
-
-    # Save vocabulary for future use
-    vocab_path = os.path.join(result_path, "vocab.json")
-    with open(vocab_path, 'w', encoding="utf-8") as vocab_file:
-        json.dump(vocab, vocab_file, ensure_ascii=False)
+def _prepare_dataset_generator(languages, split, samples, phonemizer, remapper):
+  def f():
+    train = _prepare_dataset(languages, split, samples, phonemizer, remapper)
+    for item in train:
+      yield item
+  return f
 
 
-    # Here initialization stuff goes
-    tokenizer = Wav2Vec2CTCTokenizer(vocab_path)
+def train(languages, remapper_path, output_path):
+    with open(remapper_path) as file:
+        remapper = PhonemeRemapper.load(file)
 
-    sampling_rate = 16000
+    phonemizer = EpitranPhonemizer()
+
+    vocab = _prepare_vocabulary(remapper)
+    with tempfile.NamedTemporaryFile() as tmp:
+        with open(tmp.name, 'w') as f:
+            json.dump(vocab, f, ensure_ascii=False)
+        tokenizer = Wav2Vec2CTCTokenizer(tmp.name)
+
+    global sampling_rate
     feature_extractor = Wav2Vec2FeatureExtractor(feature_size=1, sampling_rate=sampling_rate, padding_value=0.0, do_normalize=True, return_attention_mask=False)
     processor = Wav2Vec2Processor(feature_extractor=feature_extractor, tokenizer=tokenizer)
     config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base")
@@ -104,23 +91,39 @@ def train(config_path, data_path, output_path):
     model.freeze_feature_encoder()
     model.gradient_checkpointing_enable()
 
+    if True:
+        train = datasets.Dataset.from_generator(_prepare_dataset_generator(languages, "train", 3000, phonemizer, remapper))
+        test = datasets.Dataset.from_generator(_prepare_dataset_generator(languages, "test", 800, phonemizer, remapper))
 
-    # Need to apply processors on data
-    def preprocess_dataset(batch):
-        audio = batch["audio"]
 
-        # batched output is "un-batched" to ensure mapping is correct
-        res = processor(audio["array"], sampling_rate=audio["sampling_rate"], text=batch["text"])
-        batch["input_values"] = res.input_values[0]
-        batch["labels"] = res.labels
-        batch["input_length"] = len(batch["input_values"])
+        # Need to apply processors on data
+        def preprocess_dataset(batch):
+            audio = batch["audio"]
 
-        return batch
+            # batched output is "un-batched" to ensure mapping is correct
+            res = processor(audio["array"], sampling_rate=audio["sampling_rate"], text=batch["sentence"])
+            batch["input_values"] = res.input_values[0]
+            batch["labels"] = res.labels
+            batch["input_length"] = len(batch["input_values"])
+            batch["labels_length"] = len(batch["labels"])
 
-    max_input_length_in_sec = 4.0
-    dataset = dataset.map(preprocess_dataset, remove_columns=dataset.column_names["train"], num_proc=4)
-    dataset["train"] = dataset["train"].filter(lambda x: x < max_input_length_in_sec * processor.feature_extractor.sampling_rate, input_columns=["input_length"])
+            return batch
 
+
+        max_input_length_in_sec = 6.0
+        train = train.map(preprocess_dataset, remove_columns=train.column_names, num_proc=12)
+        test = test.map(preprocess_dataset, remove_columns=test.column_names, num_proc=12)
+
+        train = train.filter(lambda x: x < max_input_length_in_sec * processor.feature_extractor.sampling_rate, input_columns=["input_length"])
+
+        train = train.filter(lambda x: x > 0, input_columns=["labels_length"])
+        test = test.filter(lambda x: x > 0, input_columns=["labels_length"])
+
+        train.save_to_disk(os.path.join(output_path, "saved_train"))
+        test.save_to_disk(os.path.join(output_path, "saved_test"))
+
+    train = datasets.load_from_disk(os.path.join(output_path, "saved_train"))
+    test = datasets.load_from_disk(os.path.join(output_path, "saved_test"))
 
     @dataclass
     class DataCollatorCTCWithPadding:
@@ -187,19 +190,21 @@ def train(config_path, data_path, output_path):
 
 
     training_args = TrainingArguments(
-      output_dir=output_path,
-      group_by_length=True,
-      per_device_train_batch_size=8,
-      evaluation_strategy="steps",
-      num_train_epochs=30,
-      fp16=True,
-      save_steps=500,
-      eval_steps=500,
-      logging_steps=500,
-      learning_rate=1e-4,
-      weight_decay=0.005,
-      warmup_steps=1000,
-      save_total_limit=2,
+        output_dir=output_path,
+        group_by_length=True,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=2,
+        evaluation_strategy="steps",
+        num_train_epochs=40,
+        fp16=True,
+        save_steps=100,
+        eval_steps=100,
+        logging_steps=10,
+        weight_decay=0.005,
+        learning_rate=1e-4,
+        warmup_steps=500,
+        save_total_limit=2,
     )
 
     trainer = Trainer(
@@ -207,44 +212,18 @@ def train(config_path, data_path, output_path):
         data_collator=data_collator,
         args=training_args,
         compute_metrics=compute_metrics,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        train_dataset=train,
+        eval_dataset=test,
         tokenizer=processor.feature_extractor,
     )
 
-    trainer.train(resume_from_checkpoint=True)
-    model_path = os.path.join(output_path, "model")
-    trainer.save_model(model_path)
+    trainer.train()
 
-    model_imported = import_huggingface_model(model)
-    model_imported.eval()
 
-    torch.onnx.export(
-        model_imported,
-        torch.randn(1, 100000, requires_grad=True),
-        os.path.join(result_path, "model.onnx"),
-        export_params=True,
-        opset_version=16,
-        do_constant_folding=True,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={
-            "input": {
-                0: "batch_size",
-                1: "samples",
-            },
-            "output": {
-                0: "batch_size",
-                1: "samples",
-            },
-        },
-    )
-
-    with open(os.path.join(result_path, "config.json"), 'w', encoding="utf-8") as config_file:
-        config = {
-            "sampling_rate": sampling_rate,
-            "inputs_to_logits_ratio": model.config.inputs_to_logits_ratio,
-            "vocab": vocab,
-        }
-        json.dump(config, config_file, ensure_ascii=False)
+def add_command(subparsers):
+    parser = subparsers.add_parser('wav2vec2', help='train speech-to-text model')
+    parser.add_argument('-r','--remapper', required=True, help='path to remapper config file')
+    parser.add_argument('-o','--output', required=True, help='path to output folder')
+    parser.add_argument('-l','--language', required=True, nargs='+', help='language to build vocabulary to, space-separated if many')
+    parser.set_defaults(func=lambda args: train(args.language, args.remapper, args.output))
 

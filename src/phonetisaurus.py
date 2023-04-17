@@ -3,7 +3,7 @@ import os
 import re
 import subprocess
 import sys
-from .phoneme_remapper import PhonemeRemapper
+from .remapper import PhonemeRemapper
 from phonemizer.separator import Separator
 from phonemizer.backend import BACKENDS
 
@@ -32,6 +32,7 @@ def train(config_path, data_path, output_path):
 
     backends = {lang["wiktionary"]:BACKENDS["espeak"](lang["espeak"]) for lang in langs}
     batches = {lang["wiktionary"]:[] for lang in langs}
+    stats = {lang["wiktionary"]:{} for lang in langs}
 
     try:
         os.mkdir(output_path)
@@ -62,10 +63,15 @@ def train(config_path, data_path, output_path):
                             phones_split = phones.split(" ")
                             if len(word_split) == len(phones_split):
                                 for w, t in zip(word_split, phones_split):
+                                    for p in t.split("|"):
+                                        if p not in stats[lang_code]:
+                                            stats[lang_code][p] = 0
+                                        stats[lang_code][p] += 1
                                     t = " ".join(remapper.remap(t.split("|")))
                                     print(f"{w}\t{t}", file=out)
                         batches[lang_code] = []
 
+    print(stats)
     subprocess.check_call(["phonetisaurus-train", "--lexicon", dict_path, "--dir_prefix", output_path])
 
 

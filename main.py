@@ -1,5 +1,6 @@
 import argparse
 import src.phonetisaurus
+import src.vocabulary
 import src.wav2vec2
 
 def main():
@@ -8,6 +9,7 @@ def main():
 
     subparsers = parser.add_subparsers(help='sub-command help')
     src.phonetisaurus.add_command(subparsers)
+    src.vocabulary.add_command(subparsers)
     src.wav2vec2.add_command(subparsers)
 
     args = parser.parse_args()

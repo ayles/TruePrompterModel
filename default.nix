@@ -1,11 +1,12 @@
-{ pkgs ? import <nixpkgs> { config.allowUnfree = true; } }:
+{ pkgs }:
 
 let
-  pythonEnv = pkgs.python39.withPackages (p: with p; [
+  pythonEnv = pkgs.python310.withPackages (p: with p; [
     datasets
     librosa
     lxml
     soundfile
+    tkinter
     torch-bin
     torchaudio-bin
     transformers
@@ -24,7 +25,7 @@ let
   '';
 
   installPythonPackages = ''
-    pip install phonemizer evaluate jiwer
+    pip install phonemizer evaluate jiwer matplotlib panphon epitran
   '';
 
   setupEnvs = ''
@@ -35,13 +36,14 @@ in
   buildInputs = with pkgs; [
   ];
 
-  packages = with pkgs; [
+  nativeBuildInputs = with pkgs; [
+    (callPackage ./flite {})
     (callPackage ./mitlm {})
     espeak
     mbrola
     phonetisaurus
-    python39Packages.pip
-    python39Packages.virtualenv
+    python310Packages.pip
+    python310Packages.virtualenv
     pythonEnv
   ];
 
